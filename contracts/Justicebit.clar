@@ -19,14 +19,29 @@
 (define-constant ERR_INVALID_RELEASE_AMOUNT (err u116))
 (define-constant ERR_PARTY_ALREADY_EXISTS (err u117))
 (define-constant ERR_INVALID_THRESHOLD (err u118))
+(define-constant ERR_INSURANCE_NOT_FOUND (err u119))
+(define-constant ERR_CLAIM_NOT_FOUND (err u120))
+(define-constant ERR_INSUFFICIENT_POOL_FUNDS (err u121))
+(define-constant ERR_CLAIM_ALREADY_EXISTS (err u122))
+(define-constant ERR_CLAIM_NOT_ELIGIBLE (err u123))
+(define-constant ERR_INVALID_COVERAGE_AMOUNT (err u124))
+(define-constant ERR_CONTRIBUTOR_NOT_FOUND (err u125))
+(define-constant ERR_CLAIM_ALREADY_PROCESSED (err u126))
 
 (define-constant DISPUTE_DURATION u144)
 (define-constant MIN_JUDGE_STAKE u1000)
 (define-constant JUDGE_REWARD_PERCENTAGE u10)
+(define-constant INSURANCE_PREMIUM_RATE u2)
+(define-constant MIN_INSURANCE_CONTRIBUTION u500)
+(define-constant CLAIM_VALIDATION_PERIOD u48)
+(define-constant MAX_COVERAGE_PERCENTAGE u80)
 
 (define-data-var next-escrow-id uint u1)
 (define-data-var total-judges uint u0)
 (define-data-var next-multiparty-id uint u1)
+(define-data-var insurance-pool-balance uint u0)
+(define-data-var total-contributors uint u0)
+(define-data-var next-claim-id uint u1)
 
 (define-map escrows
   uint
@@ -119,6 +134,46 @@
 )
 
 (define-data-var next-release-id uint u1)
+
+(define-map insurance-contributors
+  principal
+  {
+    contribution: uint,
+    rewards-earned: uint,
+    joined-at: uint,
+    is-active: bool
+  }
+)
+
+(define-map escrow-insurance
+  uint
+  {
+    coverage-amount: uint,
+    premium-paid: uint,
+    is-covered: bool,
+    coverage-activated-at: uint
+  }
+)
+
+(define-map insurance-claims
+  uint
+  {
+    escrow-id: uint,
+    claimant: principal,
+    claim-amount: uint,
+    reason: (string-ascii 500),
+    submitted-at: uint,
+    status: (string-ascii 20),
+    validator-votes: uint,
+    approved-votes: uint,
+    processed-at: (optional uint)
+  }
+)
+
+(define-map claim-validations
+  { claim-id: uint, validator: principal }
+  { approved: bool, validated-at: uint }
+)
 
 (define-public (register-as-judge (stake-amount uint))
   (let ((current-stake (get stake (default-to { stake: u0, reputation: u100, total-votes: u0, correct-votes: u0, is-active: false } 
@@ -436,6 +491,179 @@
   )
 )
 
+(define-public (contribute-to-insurance-pool (amount uint))
+  (let ((current-contributor (default-to { contribution: u0, rewards-earned: u0, joined-at: u0, is-active: false }
+                                         (map-get? insurance-contributors tx-sender)))
+        (current-block stacks-block-height))
+    (asserts! (>= amount MIN_INSURANCE_CONTRIBUTION) ERR_INVALID_AMOUNT)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (if (get is-active current-contributor)
+      (map-set insurance-contributors tx-sender (merge current-contributor {
+        contribution: (+ (get contribution current-contributor) amount)
+      }))
+      (begin
+        (map-set insurance-contributors tx-sender {
+          contribution: amount,
+          rewards-earned: u0,
+          joined-at: current-block,
+          is-active: true
+        })
+        (var-set total-contributors (+ (var-get total-contributors) u1))
+      )
+    )
+    
+    (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) amount))
+    (ok true)
+  )
+)
+
+(define-public (purchase-escrow-insurance (escrow-id uint) (coverage-amount uint))
+  (let ((escrow (unwrap! (map-get? escrows escrow-id) ERR_ESCROW_NOT_FOUND))
+        (premium (/ (* coverage-amount INSURANCE_PREMIUM_RATE) u100))
+        (max-coverage (/ (* (get amount escrow) MAX_COVERAGE_PERCENTAGE) u100))
+        (current-block stacks-block-height))
+    
+    (asserts! (is-eq tx-sender (get buyer escrow)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status escrow) "active") ERR_NOT_AUTHORIZED)
+    (asserts! (> coverage-amount u0) ERR_INVALID_COVERAGE_AMOUNT)
+    (asserts! (<= coverage-amount max-coverage) ERR_INVALID_COVERAGE_AMOUNT)
+    (asserts! (is-none (map-get? escrow-insurance escrow-id)) ERR_ESCROW_ALREADY_EXISTS)
+    
+    (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
+    
+    (map-set escrow-insurance escrow-id {
+      coverage-amount: coverage-amount,
+      premium-paid: premium,
+      is-covered: true,
+      coverage-activated-at: current-block
+    })
+    
+    (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) premium))
+    (ok true)
+  )
+)
+
+(define-public (submit-insurance-claim (escrow-id uint) (claim-amount uint) (reason (string-ascii 500)))
+  (let ((escrow (unwrap! (map-get? escrows escrow-id) ERR_ESCROW_NOT_FOUND))
+        (insurance (unwrap! (map-get? escrow-insurance escrow-id) ERR_INSURANCE_NOT_FOUND))
+        (claim-id (var-get next-claim-id))
+        (current-block stacks-block-height))
+    
+    (asserts! (or (is-eq tx-sender (get buyer escrow)) (is-eq tx-sender (get seller escrow))) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-covered insurance) ERR_CLAIM_NOT_ELIGIBLE)
+    (asserts! (> claim-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= claim-amount (get coverage-amount insurance)) ERR_INVALID_COVERAGE_AMOUNT)
+    (asserts! (or (is-eq (get status escrow) "disputed") (is-eq (get status escrow) "resolved")) ERR_CLAIM_NOT_ELIGIBLE)
+    (asserts! (is-none (map-get? insurance-claims claim-id)) ERR_CLAIM_ALREADY_EXISTS)
+    
+    (map-set insurance-claims claim-id {
+      escrow-id: escrow-id,
+      claimant: tx-sender,
+      claim-amount: claim-amount,
+      reason: reason,
+      submitted-at: current-block,
+      status: "pending",
+      validator-votes: u0,
+      approved-votes: u0,
+      processed-at: none
+    })
+    
+    (var-set next-claim-id (+ claim-id u1))
+    (ok claim-id)
+  )
+)
+
+(define-public (validate-insurance-claim (claim-id uint) (approve bool))
+  (let ((claim (unwrap! (map-get? insurance-claims claim-id) ERR_CLAIM_NOT_FOUND))
+        (judge (unwrap! (map-get? judges tx-sender) ERR_NOT_AUTHORIZED))
+        (current-block stacks-block-height))
+    
+    (asserts! (get is-active judge) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status claim) "pending") ERR_CLAIM_ALREADY_PROCESSED)
+    (asserts! (is-none (map-get? claim-validations { claim-id: claim-id, validator: tx-sender })) ERR_ALREADY_VOTED)
+    
+    (map-set claim-validations { claim-id: claim-id, validator: tx-sender } {
+      approved: approve,
+      validated-at: current-block
+    })
+    
+    (let ((new-validator-votes (+ (get validator-votes claim) u1))
+          (new-approved-votes (if approve (+ (get approved-votes claim) u1) (get approved-votes claim))))
+      
+      (map-set insurance-claims claim-id (merge claim {
+        validator-votes: new-validator-votes,
+        approved-votes: new-approved-votes
+      }))
+      
+      (if (>= new-validator-votes u3)
+        (if (> new-approved-votes (/ new-validator-votes u2))
+          (process-insurance-claim claim-id)
+          (begin
+            (map-set insurance-claims claim-id (merge claim { status: "rejected", processed-at: (some current-block) }))
+            (ok false)
+          )
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-public (process-insurance-claim (claim-id uint))
+  (let ((claim (unwrap! (map-get? insurance-claims claim-id) ERR_CLAIM_NOT_FOUND))
+        (current-pool-balance (var-get insurance-pool-balance)))
+    
+    (asserts! (is-eq (get status claim) "pending") ERR_CLAIM_ALREADY_PROCESSED)
+    (asserts! (> (get approved-votes claim) (/ (get validator-votes claim) u2)) ERR_NOT_AUTHORIZED)
+    (asserts! (<= (get claim-amount claim) current-pool-balance) ERR_INSUFFICIENT_POOL_FUNDS)
+    
+    (try! (as-contract (stx-transfer? (get claim-amount claim) tx-sender (get claimant claim))))
+    
+    (map-set insurance-claims claim-id (merge claim {
+      status: "approved",
+      processed-at: (some stacks-block-height)
+    }))
+    
+    (var-set insurance-pool-balance (- current-pool-balance (get claim-amount claim)))
+    (ok true)
+  )
+)
+
+(define-public (withdraw-insurance-contribution (percentage uint))
+  (let ((contributor (unwrap! (map-get? insurance-contributors tx-sender) ERR_CONTRIBUTOR_NOT_FOUND))
+        (current-pool-balance (var-get insurance-pool-balance))
+        (total-contribution (get contribution contributor)))
+    
+    (asserts! (get is-active contributor) ERR_NOT_AUTHORIZED)
+    (asserts! (> percentage u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= percentage u100) ERR_INVALID_AMOUNT)
+    
+    (let ((withdrawal-amount (/ (* total-contribution percentage) u100))
+          (pool-share (if (> current-pool-balance u0) (/ (* withdrawal-amount u10000) current-pool-balance) u0))
+          (available-withdrawal (/ (* current-pool-balance pool-share) u10000)))
+      
+      (asserts! (> available-withdrawal u0) ERR_INSUFFICIENT_FUNDS)
+      (asserts! (<= available-withdrawal current-pool-balance) ERR_INSUFFICIENT_POOL_FUNDS)
+      
+      (try! (as-contract (stx-transfer? available-withdrawal tx-sender tx-sender)))
+      
+      (if (is-eq percentage u100)
+        (begin
+          (map-set insurance-contributors tx-sender (merge contributor { is-active: false }))
+          (var-set total-contributors (- (var-get total-contributors) u1))
+        )
+        (map-set insurance-contributors tx-sender (merge contributor {
+          contribution: (- total-contribution withdrawal-amount)
+        }))
+      )
+      
+      (var-set insurance-pool-balance (- current-pool-balance available-withdrawal))
+      (ok available-withdrawal)
+    )
+  )
+)
+
 (define-read-only (get-escrow (escrow-id uint))
   (map-get? escrows escrow-id)
 )
@@ -507,3 +735,45 @@
     none
   )
 )
+
+(define-read-only (get-insurance-pool-balance)
+  (var-get insurance-pool-balance)
+)
+
+(define-read-only (get-total-contributors)
+  (var-get total-contributors)
+)
+
+(define-read-only (get-insurance-contributor (contributor principal))
+  (map-get? insurance-contributors contributor)
+)
+
+(define-read-only (get-escrow-insurance (escrow-id uint))
+  (map-get? escrow-insurance escrow-id)
+)
+
+(define-read-only (get-insurance-claim (claim-id uint))
+  (map-get? insurance-claims claim-id)
+)
+
+(define-read-only (get-claim-validation (claim-id uint) (validator principal))
+  (map-get? claim-validations { claim-id: claim-id, validator: validator })
+)
+
+(define-read-only (get-next-claim-id)
+  (var-get next-claim-id)
+)
+
+(define-read-only (calculate-insurance-premium (coverage-amount uint))
+  (/ (* coverage-amount INSURANCE_PREMIUM_RATE) u100)
+)
+
+(define-read-only (get-max-coverage-for-escrow (escrow-id uint))
+  (match (map-get? escrows escrow-id)
+    escrow (some (/ (* (get amount escrow) MAX_COVERAGE_PERCENTAGE) u100))
+    none
+  )
+)
+
+
+
